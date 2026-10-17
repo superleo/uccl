@@ -6,7 +6,9 @@
  */
 
 #include "dietgpu/utils/DeviceUtils.h"
+#if !defined(DIETGPU_USE_MUSA)
 #include <cuda_profiler_api.h>
+#endif
 #include <mutex>
 #include <unordered_map>
 
@@ -119,7 +121,13 @@ int getDeviceForAddress(const void* p) {
   }
 
   // memoryType is deprecated for CUDA 10.0+
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA)
+  if (att.type == musaMemoryTypeHost) {
+    return -1;
+  } else {
+    return att.device;
+  }
+#elif defined(__HIP_PLATFORM_AMD__)
   if (att.type == hipMemoryTypeHost) {
     return -1;
   } else {

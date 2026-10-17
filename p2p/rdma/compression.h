@@ -20,7 +20,13 @@ enum class CompressStrategy {
 CompressStrategy get_compress_strategy_from_env();
 
 #if defined USE_DIETGPU
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_NVIDIA__) || \
+#if defined(DIETGPU_USE_MUSA)
+#include "dietgpu/float/GpuFloatCodec.h"
+#include "dietgpu/utils/DeviceUtils.h"
+#include "dietgpu/utils/GreenContext.h"
+#include "dietgpu/utils/StackDeviceMemory.h"
+#include <musa_fp16.h>
+#elif defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_NVIDIA__) || \
     defined(__HIPCC__)
 #include "dietgpu/float/GpuFloatCodec_hip.h"
 #include "dietgpu/utils/DeviceUtils_hip.h"

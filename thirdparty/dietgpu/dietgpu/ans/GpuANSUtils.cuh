@@ -8,7 +8,7 @@
 #pragma once
 
 #include <assert.h>
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 #include "dietgpu/utils/DeviceDefs.cuh"
 #include "dietgpu/utils/StaticUtils.h"
 

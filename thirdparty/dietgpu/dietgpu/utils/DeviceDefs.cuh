@@ -7,10 +7,13 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 
 namespace dietgpu {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA)
+// MUSA S5000 exposes a CUDA-compatible warp width of 32.
+constexpr int kWarpSize = 32;
+#elif defined(__HIP_PLATFORM_AMD__)
 constexpr int kWarpSize = 64;
 #else
 constexpr int kWarpSize = 32;

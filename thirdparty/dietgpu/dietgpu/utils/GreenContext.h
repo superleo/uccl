@@ -11,15 +11,20 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 
 namespace dietgpu {
 
-// Green context APIs require CUDA 12.4+
-#if CUDA_VERSION >= 12040
+#if defined(DIETGPU_USE_MUSA)
+
+inline void initGreenContextIfNeeded(int /*device*/) {
+  // The target MUSA contract has no GreenContext equivalent.
+}
+
+#elif defined(CUDA_VERSION) && CUDA_VERSION >= 12040
 
 class GreenContextManager {
  public:
@@ -189,6 +194,6 @@ inline void initGreenContextIfNeeded(int /*device*/) {
   // Green context not available on CUDA < 12.4
 }
 
-#endif // CUDA_VERSION >= 12040
+#endif // DIETGPU_USE_MUSA / CUDA_VERSION >= 12040
 
 } // namespace dietgpu

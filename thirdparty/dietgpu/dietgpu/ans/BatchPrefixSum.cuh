@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 #include <cub/cub.cuh>
 #include <vector>
 #include "dietgpu/utils/StaticUtils.h"

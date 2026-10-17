@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 
 // allow usage for non-CUDA files
 #ifndef __host__

@@ -7,17 +7,16 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
+#include <cstdint>
 
 namespace dietgpu {
 
 #if defined(__HIP_PLATFORM_AMD__)
-// using WarpMaskT = unsigned long long;
-using WarpMaskT = uint64_t;   // wave64
+using WarpMaskT = uint64_t;
 inline constexpr WarpMaskT kFullMask = 0xffffffffffffffffull;
 #else
-// using WarpMaskT = unsigned int;
-using WarpMaskT = uint32_t;   // warp32
+using WarpMaskT = uint32_t;
 inline constexpr WarpMaskT kFullMask = 0xffffffffu;
 #endif
 
@@ -32,7 +31,7 @@ __device__ __forceinline__ WarpMaskT fullMask() {
 
 __device__ __forceinline__ unsigned int
 getBitfield(uint8_t val, int pos, int len) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return ((uint32_t)val >> pos) & ((1u << len) - 1u);
 #else
   unsigned int ret;
@@ -45,7 +44,7 @@ getBitfield(uint8_t val, int pos, int len) {
 
 __device__ __forceinline__ unsigned int
 getBitfield(uint16_t val, int pos, int len) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return ((uint32_t)val >> pos) & ((1u << len) - 1u);
 #else
   unsigned int ret;
@@ -58,7 +57,7 @@ getBitfield(uint16_t val, int pos, int len) {
 
 __device__ __forceinline__ unsigned int
 getBitfield(unsigned int val, int pos, int len) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return (val >> pos) & ((1u << len) - 1u);
 #else
   unsigned int ret;
@@ -69,7 +68,7 @@ getBitfield(unsigned int val, int pos, int len) {
 
 __device__ __forceinline__ uint64_t
 getBitfield(uint64_t val, int pos, int len) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return (val >> pos) & ((1ull << len) - 1ull);
 #else
   uint64_t ret;
@@ -80,7 +79,7 @@ getBitfield(uint64_t val, int pos, int len) {
 
 __device__ __forceinline__ unsigned int
 setBitfield(unsigned int val, unsigned int toInsert, int pos, int len) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   unsigned int mask = ((1u << len) - 1u) << pos;
   return (val & ~mask) | ((toInsert << pos) & mask);
 #else
@@ -93,7 +92,7 @@ setBitfield(unsigned int val, unsigned int toInsert, int pos, int len) {
 }
 
 __device__ __forceinline__ uint32_t rotateLeft(uint32_t v, uint32_t shift) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return (v << shift) | (v >> (32u - shift));
 #else
   uint32_t out;
@@ -105,7 +104,7 @@ __device__ __forceinline__ uint32_t rotateLeft(uint32_t v, uint32_t shift) {
 }
 
 __device__ __forceinline__ uint32_t rotateRight(uint32_t v, uint32_t shift) {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
   return (v >> shift) | (v << (32u - shift));
 #else
   uint32_t out;
@@ -117,7 +116,9 @@ __device__ __forceinline__ uint32_t rotateRight(uint32_t v, uint32_t shift) {
 }
 
 __device__ __forceinline__ int getLaneId() {
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA)
+  return __get_laneid();
+#elif defined(__HIP_PLATFORM_AMD__)
   return __lane_id();
 #else
   int laneId;
@@ -130,6 +131,9 @@ __device__ __forceinline__ WarpMaskT getLaneMaskLt() {
 #if defined(__HIP_PLATFORM_AMD__)
   int lane = __lane_id(); // 0..63
   return (lane == 0) ? 0ull : ((1ull << lane) - 1ull);
+#elif defined(DIETGPU_USE_MUSA)
+  int lane = __get_laneid();
+  return (lane == 0) ? 0u : ((1u << lane) - 1u);
 #else
   WarpMaskT mask;
   asm("mov.u32 %0, %%lanemask_lt;" : "=r"(mask));
@@ -141,6 +145,9 @@ __device__ __forceinline__ WarpMaskT getLaneMaskLe() {
 #if defined(__HIP_PLATFORM_AMD__)
   int lane = __lane_id();
   return (lane == 63) ? 0xffffffffffffffffull : ((1ull << (lane + 1)) - 1ull);
+#elif defined(DIETGPU_USE_MUSA)
+  int lane = __get_laneid();
+  return (lane == 31) ? 0xffffffffu : ((1u << (lane + 1)) - 1u);
 #else
   WarpMaskT mask;
   asm("mov.u32 %0, %%lanemask_le;" : "=r"(mask));
@@ -152,6 +159,9 @@ __device__ __forceinline__ WarpMaskT getLaneMaskGt() {
 #if defined(__HIP_PLATFORM_AMD__)
   int lane = __lane_id();
   return ~getLaneMaskLe();
+#elif defined(DIETGPU_USE_MUSA)
+  int lane = __get_laneid();
+  return lane == 31 ? 0u : ~getLaneMaskLe();
 #else
   WarpMaskT mask;
   asm("mov.u32 %0, %%lanemask_gt;" : "=r"(mask));
@@ -163,6 +173,8 @@ __device__ __forceinline__ WarpMaskT getLaneMaskGe() {
 #if defined(__HIP_PLATFORM_AMD__)
   int lane = __lane_id();
   return ~getLaneMaskLt();
+#elif defined(DIETGPU_USE_MUSA)
+  return ~getLaneMaskLt();
 #else
   WarpMaskT mask;
   asm("mov.u32 %0, %%lanemask_ge;" : "=r"(mask));
@@ -173,7 +185,9 @@ __device__ __forceinline__ WarpMaskT getLaneMaskGe() {
 
 template <typename T>
 __device__ inline T warpReduceAllMin(T val) {
-#if __CUDA_ARCH__ >= 800
+#if defined(DIETGPU_USE_MUSA)
+  return __reduce_min_sync(kFullMask, val);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_min_sync(kFullMask, val);
 #else
 #pragma unroll
@@ -187,7 +201,9 @@ __device__ inline T warpReduceAllMin(T val) {
 
 template <typename T, int Width = kWarpSize>
 __device__ inline T warpReduceAllMax(T val) {
-#if __CUDA_ARCH__ >= 800
+#if defined(DIETGPU_USE_MUSA)
+  return __reduce_max_sync(kFullMask, val);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_max_sync(kFullMask, val);
 #else
 #pragma unroll
@@ -201,7 +217,9 @@ __device__ inline T warpReduceAllMax(T val) {
 
 template <typename T, int Width = kWarpSize>
 __device__ inline T warpReduceAllSum(T val) {
-#if __CUDA_ARCH__ >= 800
+#if defined(DIETGPU_USE_MUSA)
+  return __reduce_add_sync(kFullMask, val);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_add_sync(kFullMask, val);
 #else
 #pragma unroll

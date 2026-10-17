@@ -11,7 +11,7 @@
 #include "dietgpu/utils/PtxUtils.cuh"
 #include "dietgpu/utils/StaticUtils.h"
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 #include "util/debug.h"
 
 namespace dietgpu {
@@ -153,7 +153,7 @@ struct FloatTypeInfo<FloatType::kBFloat16> {
 
     uint32_t out;
 
-#if defined(__HIP_PLATFORM_AMD__)
+#if defined(DIETGPU_USE_MUSA) || defined(__HIP_PLATFORM_AMD__)
     out = (lo >> 1) | (hi << 31);
     // Emulate funnel shift right: concatenate lo:hi and shift right by 1
     // out = static_cast<uint32_t>(((uint64_t(lo) << 32) | uint64_t(hi)) >> 1);

@@ -7,7 +7,7 @@
 
 #pragma once
 
-#include <cuda.h>
+#include "dietgpu/utils/GpuRuntime.h"
 #include "dietgpu/utils/StackDeviceMemory.h"
 
 namespace dietgpu {

@@ -1,6 +1,7 @@
 # Native host-only MUSA P2P build. RDMA/IPC only; no NCCL/MCCL or CXI transport.
 # Common endpoint headers still require libfabric development headers.
 MUSA_HOME ?= /usr/local/musa
+MUSA_ARCH ?= mp_31
 MUSA_LIBDIR ?= $(MUSA_HOME)/lib
 LIBFABRIC_HOME ?= /opt/libfabric
 BUILD_DIR ?= .build/musa
@@ -25,6 +26,10 @@ endif
 PYTHON_LDFLAGS := $(shell $(PYTHON_CONFIG) --ldflags)
 PYTHON_EMBED_LDFLAGS := $(shell $(PYTHON_CONFIG) --embed --ldflags)
 INSTALL_DIR ?= $(shell $(PYTHON) -c "import site; print(site.getsitepackages()[0])")/uccl
+USE_DIETGPU ?= 0
+DIETGPU_ROOT ?= ../thirdparty/dietgpu
+DIETGPU_FLOAT_DIR ?= $(DIETGPU_ROOT)/dietgpu/float
+DIETGPU_MUSA_LIB := $(DIETGPU_FLOAT_DIR)/libdietgpu_float_musa.so
 
 override CPPFLAGS += -DUCCL_USE_MUSA \
 	-I. -I./util -I./rdma -I./rdma/providers -I./nccl -I../include \
@@ -38,6 +43,15 @@ IBV_WRAP_FLAGS := -Wl,--wrap=ibv_get_device_list \
 override LDLIBS += -L$(MUSA_LIBDIR) -lmusart -lmusa \
 	-Wl,-rpath,$(MUSA_LIBDIR) -lz -lelf -lpthread -ldl
 override LDFLAGS += -shared -Wl,-Bsymbolic-functions $(IBV_WRAP_FLAGS)
+
+ifeq ($(USE_DIETGPU),1)
+override CPPFLAGS += -DUSE_DIETGPU -DDIETGPU_USE_MUSA -I$(DIETGPU_ROOT)
+override LDLIBS += -L$(DIETGPU_FLOAT_DIR) -ldietgpu_float_musa \
+	-Wl,-rpath,$(abspath $(DIETGPU_FLOAT_DIR))
+DIETGPU_DEP := $(DIETGPU_MUSA_LIB)
+else
+DIETGPU_DEP :=
+endif
 
 P2P_PYTHON_EXT := p2p$(PYEXT)
 P2P_SHARED_LIB := libuccl_p2p.so
@@ -60,11 +74,15 @@ NB_OBJECTS := $(addprefix $(BUILD_DIR)/nanobind/,$(NB_SRCS:.cpp=.o))
 .PHONY: all clean install $(P2P_PYTHON_EXT) $(P2P_SHARED_LIB)
 all: $(P2P_PYTHON_EXT) $(P2P_SHARED_LIB)
 
-$(P2P_PYTHON_EXT): $(CORE_OBJECTS) $(BUILD_DIR)/engine_api.o $(NB_OBJECTS)
+$(P2P_PYTHON_EXT): $(CORE_OBJECTS) $(BUILD_DIR)/engine_api.o $(NB_OBJECTS) | $(DIETGPU_DEP)
 	$(CXX) $(LDFLAGS) $^ -o $@ $(LDLIBS) $(PYTHON_LDFLAGS)
 
-$(P2P_SHARED_LIB): $(CORE_OBJECTS) $(BUILD_DIR)/uccl_engine.o
+$(P2P_SHARED_LIB): $(CORE_OBJECTS) $(BUILD_DIR)/uccl_engine.o | $(DIETGPU_DEP)
 	$(CXX) $(LDFLAGS) -Wl,--no-undefined $^ -o $@ $(LDLIBS) $(PYTHON_EMBED_LDFLAGS)
+
+$(DIETGPU_MUSA_LIB):
+	$(MAKE) -C $(DIETGPU_FLOAT_DIR) -f Makefile.musa \
+		MUSA_HOME=$(MUSA_HOME) MUSA_ARCH=$(MUSA_ARCH)
 
 $(BUILD_DIR)/%.o: %.cc
 	@mkdir -p $(dir $@)
