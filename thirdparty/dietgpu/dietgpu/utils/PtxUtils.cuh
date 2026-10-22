@@ -9,6 +9,9 @@
 
 #include "dietgpu/utils/GpuRuntime.h"
 #include <cstdint>
+#if defined(DIETGPU_USE_MUSA)
+#include "dietgpu/utils/MusaWarp.muh"
+#endif
 
 namespace dietgpu {
 
@@ -183,10 +186,11 @@ __device__ __forceinline__ WarpMaskT getLaneMaskGe() {
 }
 
 
+// MUSA 专属归约实现在 .muh；其他后端保持原有实现。
 template <typename T>
 __device__ inline T warpReduceAllMin(T val) {
 #if defined(DIETGPU_USE_MUSA)
-  return __reduce_min_sync(kFullMask, val);
+  return musa_backend::warpReduceMin(val);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_min_sync(kFullMask, val);
 #else
@@ -202,7 +206,7 @@ __device__ inline T warpReduceAllMin(T val) {
 template <typename T, int Width = kWarpSize>
 __device__ inline T warpReduceAllMax(T val) {
 #if defined(DIETGPU_USE_MUSA)
-  return __reduce_max_sync(kFullMask, val);
+  return musa_backend::warpReduceMax<T, Width>(val);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_max_sync(kFullMask, val);
 #else
@@ -218,7 +222,7 @@ __device__ inline T warpReduceAllMax(T val) {
 template <typename T, int Width = kWarpSize>
 __device__ inline T warpReduceAllSum(T val) {
 #if defined(DIETGPU_USE_MUSA)
-  return __reduce_add_sync(kFullMask, val);
+  return musa_backend::warpReduceSum<T, Width>(val);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   return __reduce_add_sync(kFullMask, val);
 #else

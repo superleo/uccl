@@ -199,15 +199,46 @@ CompressStrategy NullCompressorBackend::get_compress_strategy() {
 }
 
 #ifdef USE_DIETGPU
+namespace {
+// The compressor's stream, buffers, and codec kernels belong to a single
+// device, but compress/decompress can be invoked from engine background
+// threads whose current device differs. A kernel launched from a thread
+// whose current device does not own the stream fails with
+// musaErrorInvalidResourceHandle. Pin the device for the duration of each
+// codec operation and restore the caller's device afterwards.
+class ScopedCodecDeviceGuard {
+ public:
+  explicit ScopedCodecDeviceGuard(int device) : switched_(false) {
+    GPU_RT_CHECK(gpuGetDevice(&prev_));
+    if (prev_ != device) {
+      GPU_RT_CHECK(gpuSetDevice(device));
+      switched_ = true;
+    }
+  }
+  ~ScopedCodecDeviceGuard() {
+    if (switched_) {
+      (void)gpuSetDevice(prev_);
+    }
+  }
+
+ private:
+  int prev_;
+  bool switched_;
+};
+}  // namespace
+
 DietGPUCompressorBackend::DietGPUCompressorBackend()
     : stream_(nullptr), res_(nullptr), dev_compressed_size_(nullptr) {
   compress_strategy_ = get_compress_strategy_from_env();
   if (compress_strategy_ == CompressStrategy::kNone) {
     return;
   }
+  // Capture the device that will own every codec resource below; later
+  // operations on background threads must be pinned to it.
+  device_idx_ = dietgpu::getCurrentDevice();
   // Initialize green context BEFORE creating any CUDA resources (streams,
   // memory) so that they all belong to the green context.
-  dietgpu::initGreenContextIfNeeded(dietgpu::getCurrentDevice());
+  dietgpu::initGreenContextIfNeeded(device_idx_);
 
   GPU_RT_CHECK(gpuMalloc(&dev_compressed_size_, sizeof(uint32_t)));
   // Initialize compression buffer
@@ -258,6 +289,7 @@ bool DietGPUCompressorBackend::compress(std::shared_ptr<RDMASendRequest> req) {
     UCCL_LOG(WARN) << "DietGPUCompressorBackend::compress - Invalid parameters";
     return false;
   }
+  ScopedCodecDeviceGuard guard(device_idx_);
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
   // Setup compression config
   dietgpu::FloatCompressConfig compressConfig;
@@ -319,6 +351,7 @@ bool DietGPUCompressorBackend::decompress(RemoteMemInfo const& input,
     return false;
   }
 
+  ScopedCodecDeviceGuard guard(device_idx_);
   dietgpu::FloatType ft = to_dietgpu(float_type);
 
   // Setup decompression config
@@ -370,6 +403,7 @@ void DietGPUCompressorBackend::decompress_async(RemoteMemInfo const& input,
     if (on_done) on_done(user_data);
     return;
   }
+  ScopedCodecDeviceGuard guard(device_idx_);
   dietgpu::FloatType ft = to_dietgpu(float_type);
   dietgpu::FloatDecompressConfig cfg;
   cfg.floatType = ft;
@@ -419,6 +453,7 @@ void DietGPUCompressorBackend::prepare_split_context(void* addr, size_t size,
   if (unlikely(ctx->get_float_type() == FloatType::kUndefined)) {
     return;
   }
+  ScopedCodecDeviceGuard guard(device_idx_);
   auto float_ctx = std::static_pointer_cast<FloatCompressCtx>(ctx);
   dietgpu::FloatType float_type = to_dietgpu(float_ctx->get_float_type());
   uint32_t numFloats = static_cast<uint32_t>(
@@ -464,6 +499,7 @@ bool DietGPUCompressorBackend::compress_split_one_batch(
                       "Invalid parameters";
     return false;
   }
+  ScopedCodecDeviceGuard guard(device_idx_);
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
 
   dietgpu::FloatCompressConfig compressConfig;
@@ -477,7 +513,6 @@ bool DietGPUCompressorBackend::compress_split_one_batch(
       dietgpu::roundDown(dietgpu::getUncompDataSizeFromByteSize(
                              compressConfig.floatType, ctx->maxSize),
                          ChunkSplitStrategy::kMessageChunkSizeKB);
-  GPU_RT_CHECK(gpuStreamSynchronize(stream_));
   req->local_mem = std::make_shared<RegMemBlock>(
       buffer_->addr, data_size, buffer_->mr_array, buffer_->type);
   return true;
@@ -490,6 +525,7 @@ uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
                       "Invalid parameters";
     return 0;
   }
+  ScopedCodecDeviceGuard guard(device_idx_);
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
 
   dietgpu::FloatCompressConfig compressConfig;
@@ -499,7 +535,6 @@ uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
 
   dietgpu::floatCompressEncodeOneBatch(*res_, compressConfig, *ctx,
                                        dev_compressed_size_, stream_);
-  GPU_RT_CHECK(gpuStreamSynchronize(stream_));
   // Get compressed size
   uint32_t compressedSize = 0;
   GPU_RT_CHECK(gpuMemcpy(&compressedSize, dev_compressed_size_,

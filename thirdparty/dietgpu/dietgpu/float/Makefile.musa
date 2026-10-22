@@ -1,15 +1,17 @@
-# Build the DietGPU float codec with the MUSA compiler.
-#
-# Target environment: Moore Threads S5000/PH100, MUSA mcc, mp_31.
-# This is opt-in and does not change the CUDA or ROCm Makefiles.
-
+# MUSA 原生入口构建；CUDA/ROCm 构建保持独立。
 MUSA_HOME ?= /usr/local/musa
 MCC ?= $(MUSA_HOME)/bin/mcc
 MUSA_ARCH ?= mp_31
 MUSA_LIBDIR ?= $(MUSA_HOME)/lib
+# 优先 SDK 自带的适配 CUB，也允许显式指定其他 MUSA CUB 路径。
+MUSA_CUB_INCLUDE ?= $(firstword $(foreach dir,$(MUSA_HOME)/include $(MUSA_HOME)/musa_include,$(if $(wildcard $(dir)/cub/cub.cuh),$(dir))))
+ifeq ($(wildcard $(MUSA_CUB_INCLUDE)/cub/cub.cuh),)
+$(error 未找到 MUSA CUB，请设置 MUSA_CUB_INCLUDE)
+endif
 MUSA_CXX_INCLUDE ?= /usr/include/c++/11
 MUSA_CXX_TARGET_INCLUDE ?= /usr/include/x86_64-linux-gnu/c++/11
 MUSA_CXX_BACKWARD_INCLUDE ?= /usr/include/c++/11/backward
+MUSA_CXX_LIBDIR ?= /usr/lib/gcc/x86_64-linux-gnu/11
 
 DIETGPU_ROOT = ../..
 ANS_DIR = $(DIETGPU_ROOT)/dietgpu/ans
@@ -21,50 +23,54 @@ LIB_TARGET = libdietgpu_float_musa.so
 OBJ_DIR ?= obj-musa
 
 INCLUDES = -I$(DIETGPU_ROOT) -I$(UCCL_INCLUDE)
+INCLUDES += -I$(MUSA_CUB_INCLUDE) -I$(MUSA_HOME)/include
 MCC_FLAGS = -O3 -std=c++17 -fPIC -DDIETGPU_USE_MUSA
 MCC_FLAGS += --offload-arch=$(MUSA_ARCH) $(INCLUDES)
 MCC_FLAGS += -I$(MUSA_CXX_INCLUDE) -I$(MUSA_CXX_TARGET_INCLUDE)
 MCC_FLAGS += -I$(MUSA_CXX_BACKWARD_INCLUDE)
+DEPFLAGS = -MMD -MP -MF $(@:.o=.d) -MT $@
 LDFLAGS = -shared
-LDLIBS = -L$(MUSA_LIBDIR) -lmusart -lmusa
+LDLIBS = -L$(MUSA_LIBDIR) -L$(MUSA_CXX_LIBDIR) -lmusart -lmusa
 
 UTILS_SRCS = \
 	$(UTILS_DIR)/DeviceUtils.cpp \
 	$(UTILS_DIR)/StackDeviceMemory.cpp
 
+# 只编译 .mu；其包含的 .cu 由依赖文件追踪，不再单独生成对象。
 ANS_SRCS = \
-	$(ANS_DIR)/GpuANSDecode.cu \
-	$(ANS_DIR)/GpuANSEncode.cu \
-	$(ANS_DIR)/GpuANSInfo.cu
-
+	$(ANS_DIR)/GpuANSDecode.mu \
+	$(ANS_DIR)/GpuANSEncode.mu \
+	$(ANS_DIR)/GpuANSInfo.mu
 FLOAT_SRCS = \
-	$(FLOAT_DIR)/GpuFloatCompress.cu \
-	$(FLOAT_DIR)/GpuFloatDecompress.cu \
-	$(FLOAT_DIR)/GpuFloatInfo.cu
+	$(FLOAT_DIR)/GpuFloatCompress.mu \
+	$(FLOAT_DIR)/GpuFloatDecompress.mu \
+	$(FLOAT_DIR)/GpuFloatInfo.mu
 
 UTILS_OBJS = $(patsubst $(UTILS_DIR)/%.cpp,$(OBJ_DIR)/utils_%.o,$(UTILS_SRCS))
-ANS_OBJS = $(patsubst $(ANS_DIR)/%.cu,$(OBJ_DIR)/ans_%.o,$(ANS_SRCS))
-FLOAT_OBJS = $(patsubst $(FLOAT_DIR)/%.cu,$(OBJ_DIR)/float_%.o,$(FLOAT_SRCS))
+ANS_OBJS = $(patsubst $(ANS_DIR)/%.mu,$(OBJ_DIR)/ans_%.o,$(ANS_SRCS))
+FLOAT_OBJS = $(patsubst $(FLOAT_DIR)/%.mu,$(OBJ_DIR)/float_%.o,$(FLOAT_SRCS))
 ALL_OBJS = $(UTILS_OBJS) $(ANS_OBJS) $(FLOAT_OBJS)
 
+.DEFAULT_GOAL := all
 .PHONY: all clean
-
 all: $(LIB_TARGET)
 
 $(OBJ_DIR):
 	mkdir -p $@
 
-$(OBJ_DIR)/utils_%.o: $(UTILS_DIR)/%.cpp | $(OBJ_DIR)
-	$(MCC) $(MCC_FLAGS) -c $< -o $@
+$(OBJ_DIR)/utils_%.o: $(UTILS_DIR)/%.cpp Makefile.musa | $(OBJ_DIR)
+	$(MCC) $(MCC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/ans_%.o: $(ANS_DIR)/%.cu | $(OBJ_DIR)
-	$(MCC) $(MCC_FLAGS) -c $< -o $@
+$(OBJ_DIR)/ans_%.o: $(ANS_DIR)/%.mu Makefile.musa | $(OBJ_DIR)
+	$(MCC) $(MCC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/float_%.o: $(FLOAT_DIR)/%.cu | $(OBJ_DIR)
-	$(MCC) $(MCC_FLAGS) -c $< -o $@
+$(OBJ_DIR)/float_%.o: $(FLOAT_DIR)/%.mu Makefile.musa | $(OBJ_DIR)
+	$(MCC) $(MCC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(LIB_TARGET): $(ALL_OBJS)
 	$(MCC) $(MCC_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+-include $(ALL_OBJS:.o=.d)
 
 clean:
 	rm -rf $(OBJ_DIR) $(LIB_TARGET)

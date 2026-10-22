@@ -337,7 +337,9 @@ __global__ __launch_bounds__(128) void ansDecodeKernel(
   auto totalUncompressedWords = header.getTotalUncompressedWords();
 
   // Is the data what we expect?
+#if !defined(DIETGPU_USE_MUSA)
   assert(ProbBits == header.getProbBits());
+#endif
 
   // Do we have enough space for the decompressed data?
   auto uncompressedBytes = totalUncompressedWords * sizeof(ANSDecodedT);

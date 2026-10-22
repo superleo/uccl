@@ -1,0 +1,46 @@
+#pragma once
+
+#include "dietgpu/utils/DeviceDefs.cuh"
+#include <cstdint>
+
+#if !defined(DIETGPU_USE_MUSA)
+#error "MusaWarp.muh requires DIETGPU_USE_MUSA"
+#endif
+
+namespace dietgpu {
+namespace musa_backend {
+
+// MUSA 5.2 使用已验证的 down-shuffle 链，避免选择 CUDA reduction intrinsic。
+// 每个子组归约后广播首 lane；Width 保持共享接口的子组语义。
+template <typename T, int Width = kWarpSize>
+__device__ inline T warpReduceMin(T val) {
+  static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
+#pragma unroll
+  for (int offset = Width / 2; offset > 0; offset >>= 1) {
+    val = min(val, __shfl_down_sync(0xffffffffu, val, offset, Width));
+  }
+  return __shfl_sync(0xffffffffu, val, 0, Width);
+}
+
+template <typename T, int Width = kWarpSize>
+__device__ inline T warpReduceMax(T val) {
+  static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
+#pragma unroll
+  for (int offset = Width / 2; offset > 0; offset >>= 1) {
+    val = max(val, __shfl_down_sync(0xffffffffu, val, offset, Width));
+  }
+  return __shfl_sync(0xffffffffu, val, 0, Width);
+}
+
+template <typename T, int Width = kWarpSize>
+__device__ inline T warpReduceSum(T val) {
+  static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
+#pragma unroll
+  for (int offset = Width / 2; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xffffffffu, val, offset, Width);
+  }
+  return __shfl_sync(0xffffffffu, val, 0, Width);
+}
+
+} // namespace musa_backend
+} // namespace dietgpu

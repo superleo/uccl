@@ -61,15 +61,24 @@ enum UCCLLogSubsys {
   UCCL_SUBSYS_NONE
 };
 
-static std::unordered_map<std::string_view, UCCLLogSubsys>
-    uccl_log_subsys_map_ = {{"INIT", UCCLLogSubsys::UCCL_INIT},
-                            {"AFXDP", UCCLLogSubsys::UCCL_AFXDP},
-                            {"DPDK", UCCLLogSubsys::UCCL_DPDK},
-                            {"EFA", UCCLLogSubsys::UCCL_EFA},
-                            {"RDMA", UCCLLogSubsys::UCCL_RDMA},
-                            {"EP", UCCLLogSubsys::UCCL_EP},
-                            {"P2P", UCCLLogSubsys::UCCL_P2P},
-                            {"UTIL", UCCLLogSubsys::UCCL_UTIL}};
+// Constructed on first use. A namespace-scope `static` map here would be a
+// classic init-order fiasco: every .so that includes this header gets its
+// own copy of `ucclLogger`, and a logger constructed before the map in a
+// different TU (observed: libdietgpu static init with UCCL_DEBUG_SUBSYS set)
+// touches uninitialized memory and crashes at dlopen.
+inline std::unordered_map<std::string_view, UCCLLogSubsys>&
+uccl_log_subsys_map() {
+  static std::unordered_map<std::string_view, UCCLLogSubsys> map_ = {
+      {"INIT", UCCLLogSubsys::UCCL_INIT},
+      {"AFXDP", UCCLLogSubsys::UCCL_AFXDP},
+      {"DPDK", UCCLLogSubsys::UCCL_DPDK},
+      {"EFA", UCCLLogSubsys::UCCL_EFA},
+      {"RDMA", UCCLLogSubsys::UCCL_RDMA},
+      {"EP", UCCLLogSubsys::UCCL_EP},
+      {"P2P", UCCLLogSubsys::UCCL_P2P},
+      {"UTIL", UCCLLogSubsys::UCCL_UTIL}};
+  return map_;
+}
 
 class UCCLLogger;
 class UCCLLogCapture;
@@ -414,8 +423,8 @@ class UCCLLogger {
       auto token = sv.substr(0, comma);
       if (token == "ALL") {
         subsys_bitset_.set();
-      } else if (uccl_log_subsys_map_.count(token)) {
-        subsys_bitset_.set(uccl_log_subsys_map_[token]);
+      } else if (uccl_log_subsys_map().count(token)) {
+        subsys_bitset_.set(uccl_log_subsys_map()[token]);
       }
       if (comma == std::string_view::npos) break;
       sv = sv.substr(comma + 1);

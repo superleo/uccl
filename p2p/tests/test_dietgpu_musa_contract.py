@@ -17,6 +17,9 @@ MUSA_MAKEFILE = ROOT / "thirdparty/dietgpu/dietgpu/float/Makefile.musa"
 P2P_MAKEFILE = ROOT / "p2p/Makefile.musa"
 DEVICE_DEFS = ROOT / "thirdparty/dietgpu/dietgpu/utils/DeviceDefs.cuh"
 PTX_UTILS = ROOT / "thirdparty/dietgpu/dietgpu/utils/PtxUtils.cuh"
+MUSA_WARP = ROOT / "thirdparty/dietgpu/dietgpu/utils/MusaWarp.muh"
+ENGINE = ROOT / "p2p/engine.cc"
+COMPRESSION = ROOT / "p2p/rdma/compression.cc"
 
 
 class DietGpuMusaContractTest(unittest.TestCase):
@@ -143,6 +146,40 @@ class DietGpuMusaContractTest(unittest.TestCase):
     def test_device_sources_have_explicit_musa_branches(self):
         self.assertIn("DIETGPU_USE_MUSA", DEVICE_DEFS.read_text())
         self.assertIn("DIETGPU_USE_MUSA", PTX_UTILS.read_text())
+
+    def test_musa_warp_reductions_are_compile_time_unrolled(self):
+        source = MUSA_WARP.read_text()
+        self.assertIn("#pragma unroll", source)
+        self.assertNotIn("unroll(disable)", source)
+
+    def test_gpu_proxy_threads_pin_the_local_device_once(self):
+        source = ENGINE.read_text()
+        for method in (
+            "void Endpoint::send_proxy_thread_func()",
+            "void Endpoint::recv_proxy_thread_func()",
+        ):
+            start = source.index(method)
+            body = source[start : source.index("\n}", start) + 2]
+            self.assertIn("GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));", body)
+
+    def test_split_and_encode_do_not_repeat_codec_synchronization(self):
+        source = COMPRESSION.read_text()
+        split_start = source.index(
+            "bool DietGPUCompressorBackend::compress_split_one_batch("
+        )
+        split_end = source.index(
+            "uint32_t DietGPUCompressorBackend::compress_encode_one_batch(",
+            split_start,
+        )
+        encode_start = split_end
+        encode_end = source.index(
+            "CompressStrategy DietGPUCompressorBackend::get_compress_strategy()",
+            encode_start,
+        )
+        self.assertNotIn("gpuStreamSynchronize(stream_)", source[split_start:split_end])
+        self.assertNotIn(
+            "gpuStreamSynchronize(stream_)", source[encode_start:encode_end]
+        )
 
 
 if __name__ == "__main__":

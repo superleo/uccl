@@ -280,6 +280,10 @@ class DietGPUCompressorBackend : public ICompressorBackend {
   gpuStream_t stream_;                             // GPU stream
   dietgpu::StackDeviceMemory* res_;  // Device memory for compress/decompress
   CompressStrategy compress_strategy_;
+  // Device owning stream_/buffer_/decompressBuffer_/res_. Codec operations
+  // may run on engine background threads whose current device differs;
+  // kernel launches must be pinned to this device.
+  int device_idx_;
 };
 
 #endif  // USE_DIETGPU

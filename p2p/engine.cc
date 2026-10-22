@@ -2597,6 +2597,9 @@ void Endpoint::initialize_engine() {
 
 void Endpoint::send_proxy_thread_func() {
   uccl::pin_thread_to_numa(numa_node_);
+  // Keep the proxy on the endpoint GPU. This avoids a device switch around
+  // every DietGPU split/encode operation on this long-lived worker.
+  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
@@ -2638,6 +2641,9 @@ void Endpoint::send_proxy_thread_func() {
 
 void Endpoint::recv_proxy_thread_func() {
   uccl::pin_thread_to_numa(numa_node_);
+  // Keep the proxy on the endpoint GPU. This avoids a device switch around
+  // every DietGPU decode operation on this long-lived worker.
+  GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
   // bulk copy
   alignas(16) char task_buffer[16];
