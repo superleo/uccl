@@ -589,7 +589,9 @@ FloatDecompressStatus floatDecompressDevice(
     auto outProviderANS =                                                 \
         FloatOutProvider<InProvider, OutProvider, FT, kDefaultBlockSize>( \
             inProvider, outProvider);                                     \
-                                                                          \
+    /* fused 路径下 ANS 解压符号数即本层元素数（fp8 已在上游折半），   */ \
+    /* 可据此在 host 侧算出 ANS 块数上界，供 decode 自适应收缩 grid。 */ \
+    uint32_t numBlocksHint = divUp(maxCapacity, kDefaultBlockSize);       \
     ansDecodeBatch(                                                       \
         res,                                                              \
         config.ansConfig,                                                 \
@@ -598,7 +600,8 @@ FloatDecompressStatus floatDecompressDevice(
         outProviderANS,                                                   \
         outSuccess_dev,                                                   \
         outSize_dev,                                                      \
-        stream);                                                          \
+        stream,                                                           \
+        numBlocksHint);                                                   \
   } while (false)
 
     switch (config.floatType) {

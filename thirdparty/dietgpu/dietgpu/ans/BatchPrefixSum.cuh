@@ -9,10 +9,18 @@
 
 #include "dietgpu/utils/GpuRuntime.h"
 #include <cub/cub.cuh>
+#include <cstdlib>
+#include <cstdio>
 #include <vector>
 #include "dietgpu/utils/StaticUtils.h"
 
 namespace dietgpu {
+
+// 诊断专用（VC_ENCODE_KERNEL_TIMING=1）：prefix-sum 各级 kernel 分段计时。
+inline bool encode_ps_timing_enabled() {
+  static bool const enabled = std::getenv("VC_ENCODE_KERNEL_TIMING") != nullptr;
+  return enabled;
+}
 
 // FIXME: at some point, batchExclusivePrefixSum1 can no longer be run with
 // 1024 threads. Restrict our max threads to 512
@@ -134,6 +142,19 @@ void batchExclusivePrefixSum(
   // maximum size we can handle with a two-level reduction
   assert(batchSize <= kMaxBEPSThreads * kMaxBEPSThreads);
 
+  // 诊断专用（VC_ENCODE_KERNEL_TIMING=1）：ev[0]=链头，之后每级 kernel 结束
+  // 记录一个 event；evLast 为最后一个已记录的下标。
+  bool const ekTiming = encode_ps_timing_enabled();
+  cudaEvent_t ev[4];
+  int evLast = 0;
+  if (ekTiming) {
+    for (int i = 0; i < 4; ++i) {
+      cudaEventCreateWithFlags(&ev[i], cudaEventDefault);
+    }
+    cudaEventRecord(ev[0], stream);
+    evLast = 0;
+  }
+
 #define BPS_LEVEL_1(THREADS, TEMP)                        \
   batchExclusivePrefixSum1<T, THREADS, TransformFn>       \
       <<<dim3(blocks, numInBatch), THREADS, 0, stream>>>( \
@@ -155,6 +176,9 @@ void batchExclusivePrefixSum(
     assert(temp_dev); // must have this allocated
 
     BPS_LEVEL_1(kMaxBEPSThreads, temp_dev);
+    if (ekTiming) {
+      cudaEventRecord(ev[1], stream);
+    }
 
     if (blocks <= 32) {
       BPS_LEVEL_2(32);
@@ -168,8 +192,15 @@ void batchExclusivePrefixSum(
       assert(blocks <= kMaxBEPSThreads);
       BPS_LEVEL_2(kMaxBEPSThreads);
     }
+    if (ekTiming) {
+      cudaEventRecord(ev[2], stream);
+    }
 
     BPS_LEVEL_3(kMaxBEPSThreads);
+    if (ekTiming) {
+      cudaEventRecord(ev[3], stream);
+      evLast = 3;
+    }
   } else {
     // single-level reduction
     uint32_t blocks = 1;
@@ -185,6 +216,27 @@ void batchExclusivePrefixSum(
     } else {
       assert(batchSize <= kMaxBEPSThreads);
       BPS_LEVEL_1(kMaxBEPSThreads, (T*)nullptr);
+    }
+    if (ekTiming) {
+      cudaEventRecord(ev[1], stream);
+      evLast = 1;
+    }
+  }
+
+  if (ekTiming) {
+    cudaEventSynchronize(ev[evLast]);
+    float ms1 = 0, ms2 = 0, ms3 = 0;
+    cudaEventElapsedTime(&ms1, ev[0], ev[1]);
+    if (evLast >= 3) {
+      cudaEventElapsedTime(&ms2, ev[1], ev[2]);
+      cudaEventElapsedTime(&ms3, ev[2], ev[3]);
+    }
+    fprintf(stderr,
+            "[ek-ps] numInBatch=%u batchSize=%u levels=%d ps1=%.3f "
+            "ps2=%.3f ps3=%.3f ms\n",
+            numInBatch, batchSize, evLast, ms1, ms2, ms3);
+    for (int i = 0; i < 4; ++i) {
+      cudaEventDestroy(ev[i]);
     }
   }
 

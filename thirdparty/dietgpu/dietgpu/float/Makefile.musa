@@ -24,7 +24,10 @@ OBJ_DIR ?= obj-musa
 
 INCLUDES = -I$(DIETGPU_ROOT) -I$(UCCL_INCLUDE)
 INCLUDES += -I$(MUSA_CUB_INCLUDE) -I$(MUSA_HOME)/include
-MCC_FLAGS = -O3 -std=c++17 -fPIC -DDIETGPU_USE_MUSA
+# -DNDEBUG 必须保留：设备端 assert 编入 rANS 热路径会在高并发驻留下带来
+# 每次数十 ns、总量毫秒级的固定开销（16MiB k=1 floatCompress 2.27→0.57ms，
+# full kernel 6.45→0.044ms，实测见 dietgpu-musa-test-report-20261019.md §15）。
+MCC_FLAGS = -O3 -std=c++17 -fPIC -DNDEBUG -DDIETGPU_USE_MUSA
 MCC_FLAGS += --offload-arch=$(MUSA_ARCH) $(INCLUDES)
 MCC_FLAGS += -I$(MUSA_CXX_INCLUDE) -I$(MUSA_CXX_TARGET_INCLUDE)
 MCC_FLAGS += -I$(MUSA_CXX_BACKWARD_INCLUDE)

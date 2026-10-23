@@ -19,6 +19,7 @@
 
 #include "util/debug.h"
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -27,6 +28,35 @@
 
 namespace dietgpu {
 #define THRUST_DISABLE_EXEC_CHECK
+
+// 诊断专用分段计时（VC_ENCODE_KERNEL_TIMING=1）：用 stream event 测量
+// encode 链各 kernel 的 GPU 耗时。仅用于瓶颈归因，不用于正式性能采样。
+inline bool encode_kernel_timing_enabled() {
+  static bool const enabled = std::getenv("VC_ENCODE_KERNEL_TIMING") != nullptr;
+  return enabled;
+}
+
+// Experiment knob for the number of consecutive full blocks encoded by each
+// warp in ansEncodeBatchFull. Historical note: the "per-warp-slot fixed cost"
+// that motivated this merging was later traced to device-side asserts compiled
+// into the rANS hot path (the MUSA build was missing -DNDEBUG; fixed in
+// float/Makefile.musa, see docs/musa/dietgpu-musa-test-report-20261019.md §15).
+// With NDEBUG in place k=1 is optimal. VC_ENCODE_BLOCKS_PER_WARP can still
+// raise the merge factor; the unset default stays at 1.
+// When VC_ENCODE_BLOCKS_PER_WARP is set it overrides the merge
+// factor (clamped to [1, 16]). Unset stays at 1: with -DNDEBUG that is the
+// measured optimum, and the old adaptive default was fit on the assert build.
+inline uint32_t encode_blocks_per_warp() {
+  static uint32_t const v = [] {
+    auto e = std::getenv("VC_ENCODE_BLOCKS_PER_WARP");
+    if (!e) {
+      return 1u;
+    }
+    unsigned long n = std::strtoul(e, nullptr, 10);
+    return n < 1u ? 1u : (n > 16u ? 16u : (uint32_t)n);
+  }();
+  return v;
+}
 
 // maximum raw compressed data block size in bytes
 constexpr __host__ __device__ uint32_t
@@ -328,11 +358,13 @@ __device__ void ansEncodeBlocksFull(
     // output array of per-block sizes of number of ANSEncodedT words per block
     uint32_t* __restrict__ compressedWords,
     // the encoding table that we will load into smem
-    const uint4* __restrict__ table) {
+    const uint4* __restrict__ table,
+    // how many consecutive blocks each warp encodes
+    uint32_t blocksPerWarp) {
   // grid-wide warp id
   auto tid = threadIdx.x;
   // so we know the block is warp uniform
-  int block =
+  int warpId =
       __shfl_sync(kFullMask, (blockIdx.x * blockDim.x + tid) / kWarpSize, 0);
   int laneId = getLaneId();
 
@@ -345,34 +377,41 @@ __device__ void ansEncodeBlocksFull(
 
   __syncthreads();
 
-  // How big is this block?
-  uint32_t start = block * BlockSize;
-  uint32_t end = min(start + BlockSize, uncompressedWords);
+  // Each warp encodes up to `blocksPerWarp` consecutive blocks; see
+  // encode_blocks_per_warp() above for the history of the per-warp-slot cost
+  // this merging addressed (device-side asserts, fixed via -DNDEBUG).
+  uint32_t block = (uint32_t)warpId * blocksPerWarp;
 
-  auto blockSize = end - start;
-
-  // Either the warp is an excess one, or the last block is not a full block and
-  // needs to be processed using the partial kernel
-  if (block >= numBlocks || blockSize != BlockSize) {
+  // Either the warp is an excess one, or all of its blocks are beyond the end
+  if (block >= numBlocks) {
     return;
   }
 
-  auto inBlock = in + start;
-  auto outBlock = (ANSWarpState*)(out + block * outBlockStride);
+  uint32_t endBlock = min(block + blocksPerWarp, numBlocks);
+  for (; block < endBlock; ++block) {
+    // The (at most one) partial tail block is handled by the partial kernel
+    if ((block + 1) * BlockSize > uncompressedWords) {
+      return;
+    }
 
-  // all input blocks must meet alignment requirements
-  assert(isPointerAligned(inBlock, kANSRequiredAlignment));
+    uint32_t start = block * BlockSize;
+    auto inBlock = in + start;
+    auto outBlock = (ANSWarpState*)(out + block * outBlockStride);
 
-  auto outWords = ANSEncodeWarpFullBlock<ProbBits, BlockSize, false>::encode(
-      laneId, inBlock, smemLookup, outBlock);
+    // all input blocks must meet alignment requirements
+    assert(isPointerAligned(inBlock, kANSRequiredAlignment));
 
-  if (laneId == 0) {
-    // If the bound on max compressed size is not correct, this assert will go
-    // off. This block of data was then somewhat adversarial in terms of
-    // incompressibility. In this case, the getRawCompBlockMaxSize max estimate
-    // needs to increase.
-    assert(outWords <= getRawCompBlockMaxSize(BlockSize) / sizeof(ANSEncodedT));
-    compressedWords[block] = outWords;
+    auto outWords = ANSEncodeWarpFullBlock<ProbBits, BlockSize, false>::encode(
+        laneId, inBlock, smemLookup, outBlock);
+
+    if (laneId == 0) {
+      // If the bound on max compressed size is not correct, this assert will
+      // go off. This block of data was then somewhat adversarial in terms of
+      // incompressibility. In this case, the getRawCompBlockMaxSize max
+      // estimate needs to increase.
+      assert(outWords <= getRawCompBlockMaxSize(BlockSize) / sizeof(ANSEncodedT));
+      compressedWords[block] = outWords;
+    }
   }
 }
 
@@ -457,7 +496,9 @@ __global__ void ansEncodeBatchFull(
     uint32_t* __restrict__ compressedWords,
     // the encoding table that we will load into smem
     // [batch][kNumSymbols]
-    const uint4* __restrict__ table) {
+    const uint4* __restrict__ table,
+    // how many consecutive blocks each warp encodes
+    uint32_t blocksPerWarp) {
   // which batch element we are processing
   auto batch = blockIdx.y;
 
@@ -472,7 +513,8 @@ __global__ void ansEncodeBatchFull(
       maxCompressedBlockSize,
       out + batch * maxNumCompressedBlocks * maxCompressedBlockSize,
       compressedWords + batch * maxNumCompressedBlocks,
-      table + batch * kNumSymbols);
+      table + batch * kNumSymbols,
+      blocksPerWarp);
 }
 
 template <typename InProvider, int ProbBits, int BlockSize>
@@ -535,15 +577,19 @@ __device__ void ansEncodeCoalesce(
     bool useChecksum,
     uint32_t numBlocks,
     uint32_t uncompressedWords,
+    uint32_t blocksPerCTA,
     uint8_t* __restrict__ out,
     uint32_t* __restrict__ compressedBytes) {
-  auto block = blockIdx.x;
   auto tid = threadIdx.x;
+  // Each CTA coalesces up to `blocksPerCTA` consecutive compressed blocks;
+  // see the coalesce launch site in ansEncodeBatchDevice for the history of
+  // the per-CTA cost model behind this merging.
+  auto block0 = blockIdx.x * blocksPerCTA;
 
   ANSCoalescedHeader* headerOut = (ANSCoalescedHeader*)out;
 
   // The first block will be responsible for the coalesced header
-  if (block == 0) {
+  if (blockIdx.x == 0) {
     if (tid == 0) {
       uint32_t totalCompressedWords = 0;
 
@@ -588,38 +634,39 @@ __device__ void ansEncodeCoalesce(
     }
   }
 
-  if (block >= numBlocks) {
+  if (block0 >= numBlocks) {
     return;
   }
 
-  // where our per-warp data lies
-  auto uncoalescedBlock = inUncoalescedBlocks + block * uncoalescedBlockStride;
+  uint32_t blockEnd = block0 + blocksPerCTA;
+  if (blockEnd > numBlocks) {
+    blockEnd = numBlocks;
+  }
 
-  // Write per-block warp state
-  if (tid < kWarpSize) {
-    auto warpStateIn = (ANSWarpState*)uncoalescedBlock;
+  // Write per-block warp state (one warp state per compressed block)
+  for (auto i = tid; i < (blockEnd - block0) * kWarpSize; i += Threads) {
+    auto b = block0 + i / kWarpSize;
+    auto warpStateIn =
+        (ANSWarpState*)(inUncoalescedBlocks + b * uncoalescedBlockStride);
 
-    headerOut->getWarpStates()[block].warpState[tid] =
-        warpStateIn->warpState[tid];
+    headerOut->getWarpStates()[b].warpState[i % kWarpSize] =
+        warpStateIn->warpState[i % kWarpSize];
   }
 
   auto blockWordsOut = headerOut->getBlockWords(numBlocks);
 
   // Write out per-block word length
-  for (auto i = blockIdx.x * Threads + tid; i < numBlocks;
-       i += gridDim.x * Threads) {
+  for (auto i = tid; i < blockEnd - block0; i += Threads) {
+    auto b = block0 + i;
     uint32_t lastBlockWords = uncompressedWords % kDefaultBlockSize;
     lastBlockWords = lastBlockWords == 0 ? kDefaultBlockSize : lastBlockWords;
 
     uint32_t blockWords =
-        (i == numBlocks - 1) ? lastBlockWords : kDefaultBlockSize;
+        (b == numBlocks - 1) ? lastBlockWords : kDefaultBlockSize;
 
-    blockWordsOut[i] = uint2{
-        (blockWords << 16) | compressedWords[i], compressedWordsPrefix[i]};
+    blockWordsOut[b] = uint2{
+        (blockWords << 16) | compressedWords[b], compressedWordsPrefix[b]};
   }
-
-  // Number of compressed words in this block
-  uint32_t numWords = compressedWords[block];
 
   // We always have a valid multiple of kBlockAlignment bytes on both
   // uncoalesced src and coalesced dest, even though numWords (actual encoded
@@ -627,14 +674,21 @@ __device__ void ansEncodeCoalesce(
   using LoadT = uint4;
   static_assert(sizeof(LoadT) == kBlockAlignment, "");
 
-  uint32_t limitEnd = divUp(numWords, kBlockAlignment / sizeof(ANSEncodedT));
+  for (auto b = block0; b < blockEnd; ++b) {
+    // Number of compressed words in this block
+    uint32_t numWords = compressedWords[b];
 
-  auto inT = (const LoadT*)(uncoalescedBlock + sizeof(ANSWarpState));
-  auto outT = (LoadT*)(headerOut->getBlockDataStart(numBlocks) +
-                       compressedWordsPrefix[block]);
+    uint32_t limitEnd = divUp(numWords, kBlockAlignment / sizeof(ANSEncodedT));
 
-  for (uint32_t i = tid; i < limitEnd; i += Threads) {
-    outT[i] = inT[i];
+    auto inT = (const LoadT*)(inUncoalescedBlocks +
+                              b * uncoalescedBlockStride +
+                              sizeof(ANSWarpState));
+    auto outT = (LoadT*)(headerOut->getBlockDataStart(numBlocks) +
+                         compressedWordsPrefix[b]);
+
+    for (uint32_t i = tid; i < limitEnd; i += Threads) {
+      outT[i] = inT[i];
+    }
   }
 }
 
@@ -650,6 +704,7 @@ __global__ void ansEncodeCoalesceBatch(
     const uint4* __restrict__ table,
     uint32_t probBits,
     bool useChecksum,
+    uint32_t blocksPerCTA,
     OutProvider outProvider,
     uint32_t* __restrict__ compressedBytes) {
   auto batch = blockIdx.y;
@@ -678,6 +733,7 @@ __global__ void ansEncodeCoalesceBatch(
       useChecksum,
       numBlocks,
       uncompressedWords,
+      blocksPerCTA,
       (uint8_t*)outProvider.getBatchStart(batch),
       compressedBytes);
 }
@@ -696,6 +752,18 @@ void ansEncodeBatchDevice(
   auto maxUncompressedWords = maxSize / sizeof(ANSDecodedT);
   uint32_t maxNumCompressedBlocks =
       divUp(maxUncompressedWords, kDefaultBlockSize);
+
+  // 诊断专用（VC_ENCODE_KERNEL_TIMING=1）：event 序列
+  // [0]=链头 [1]=quantize 后 [2]=Full 后 [3]=Partial 后
+  // [4]=prefix-sum 后 [5]=Coalesce 后
+  bool const ekTiming = encode_kernel_timing_enabled();
+  cudaEvent_t ev[6];
+  if (ekTiming) {
+    for (int i = 0; i < 6; ++i) {
+      cudaEventCreateWithFlags(&ev[i], cudaEventDefault);
+    }
+    cudaEventRecord(ev[0], stream);
+  }
 
   // 1. Compute symbol statistics
   auto table_dev = res.alloc<uint4>(stream, numInBatch * kNumSymbols);
@@ -723,6 +791,10 @@ void ansEncodeBatchDevice(
         tempHistogram_dev.data(),
         table_dev.data(),
         stream);
+  }
+
+  if (ekTiming) {
+    cudaEventRecord(ev[1], stream);
   }
 
   // 2. Compute checksum on input data (optional)
@@ -753,9 +825,17 @@ void ansEncodeBatchDevice(
   if (maxNumCompressedBlocks > 0) {
     constexpr int kThreads = 256;
 
+    // One block per warp unless VC_ENCODE_BLOCKS_PER_WARP overrides it.
+    // Merging warps was a win only while device asserts were still in the
+    // rANS path; -DNDEBUG made k=1 the faster default.
+    uint32_t blocksPerWarp = encode_blocks_per_warp();
+
     // The grid for the full block kernel
     auto gridFull = dim3(
-        divUp((int)maxNumCompressedBlocks, kThreads / kWarpSize), numInBatch);
+        divUp(
+            (int)maxNumCompressedBlocks,
+            (kThreads / kWarpSize) * (int)blocksPerWarp),
+        numInBatch);
 
     // The grid for the partial block kernel; at most 1 partial block per input
     // in the batch
@@ -769,9 +849,12 @@ void ansEncodeBatchDevice(
             maxNumCompressedBlocks,                            \
             uncoalescedBlockStride,                            \
             compressedBlocks_dev.data(),                       \
-            compressedWords_dev.data(),                        \
-            table_dev.data());                                 \
-                                                               \
+            compressedWords_dev.data(),                       \
+            table_dev.data(),                                  \
+            blocksPerWarp);                                    \
+    if (ekTiming) {                                            \
+      cudaEventRecord(ev[2], stream);                          \
+    }                                                          \
     ansEncodeBatchPartial<InProvider, BITS, kDefaultBlockSize> \
         <<<gridPartial, kThreads, 0, stream>>>(                \
             inProvider,                                        \
@@ -780,6 +863,9 @@ void ansEncodeBatchDevice(
             compressedBlocks_dev.data(),                       \
             compressedWords_dev.data(),                        \
             table_dev.data());                                 \
+    if (ekTiming) {                                            \
+      cudaEventRecord(ev[3], stream);                          \
+    }                                                          \
   } while (false)
 
     switch (config.probBits) {
@@ -833,12 +919,22 @@ void ansEncodeBatchDevice(
     }
   }
 
+  if (ekTiming) {
+    cudaEventRecord(ev[4], stream);
+  }
+
   // Coalesce the data into one contiguous buffer
   // Even if there is nothing to compress, we still need to create a compression
   // header
   {
+    // 64-thread CTAs, one compressed block each. Merging several blocks
+    // into one CTA was measured while device asserts were still compiled
+    // in; -DNDEBUG removed that per-slot cost, so the default stays at 1.
     constexpr int kThreads = 64;
-    auto grid = dim3(std::max(maxNumCompressedBlocks, 1U), numInBatch);
+    uint32_t blocksPerCTA = 1;
+
+    auto grid = dim3(
+        std::max(divUp(maxNumCompressedBlocks, blocksPerCTA), 1U), numInBatch);
 
     ansEncodeCoalesceBatch<InProvider, OutProvider, kThreads>
         <<<grid, kThreads, 0, stream>>>(
@@ -852,8 +948,30 @@ void ansEncodeBatchDevice(
             table_dev.data(),
             config.probBits,
             config.useChecksum,
+            blocksPerCTA,
             outProvider,
             outSize_dev);
+  }
+
+  if (ekTiming) {
+    cudaEventRecord(ev[5], stream);
+    cudaEventSynchronize(ev[5]);
+    float msQuantize = 0, msFull = 0, msPartial = 0, msPs = 0, msCoalesce = 0;
+    cudaEventElapsedTime(&msQuantize, ev[0], ev[1]);
+    if (maxNumCompressedBlocks > 0) {
+      cudaEventElapsedTime(&msFull, ev[1], ev[2]);
+      cudaEventElapsedTime(&msPartial, ev[2], ev[3]);
+      cudaEventElapsedTime(&msPs, ev[3], ev[4]);
+    }
+    cudaEventElapsedTime(&msCoalesce, ev[4], ev[5]);
+    fprintf(stderr,
+            "[ek] numInBatch=%u blocks=%u quantize=%.3f full=%.3f "
+            "partial=%.3f ps=%.3f coalesce=%.3f ms\n",
+            numInBatch, maxNumCompressedBlocks, msQuantize, msFull, msPartial,
+            msPs, msCoalesce);
+    for (int i = 0; i < 6; ++i) {
+      cudaEventDestroy(ev[i]);
+    }
   }
 
   CUDA_TEST_ERROR();

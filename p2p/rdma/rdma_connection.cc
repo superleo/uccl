@@ -758,6 +758,18 @@ int64_t SendConnection::compress_write_request_split_first(
     drain_failed_request(wr_id, 0);
     return kPostError;
   }
+
+  // Slot lifecycle: the codec backend assigns a writer-side staging slot when
+  // the split starts (compress_split below). It is handed back on full-ACK in
+  // poll_ack_ring(); on any post failure we free it here since no ACK will
+  // ever arrive for a drained request.
+  auto release_compress_slot = [&req]() {
+    if (req->compress_buffer_slot >= 0) {
+      Compressor::get_instance().free_compress_slot(req->compress_buffer_slot);
+      req->compress_buffer_slot = -1;
+    }
+  };
+
   uint64_t arena_offset = 0;
   while (!decompress_arena_.try_reserve(arena_bytes, &arena_offset)) {
     send_routine();
@@ -795,7 +807,29 @@ int64_t SendConnection::compress_write_request_split_first(
 
   uint64_t slot_base = remote_decompress_buf_.addr + arena_offset;
   // Phase 1: split into compress_buffer, post to slot_base.
-  Compressor::get_instance().compress_split_one_batch(req);
+  // A hard failure must abort the request. A full slot pool waits until
+  // poll_ack_ring (via send_routine) recycles one.
+  for (;;) {
+    SplitBatchResult split =
+        Compressor::get_instance().compress_split_one_batch(req);
+    if (split == SplitBatchResult::kOk) break;
+    if (split == SplitBatchResult::kBusy) {
+      send_routine();
+      std::this_thread::yield();
+      continue;
+    }
+    drain_failed_request(wr_id, 0);
+    return kPostError;
+  }
+  // The slot id is now final — record it in the pending entry so
+  // poll_ack_ring() can release it on full-ACK.
+  {
+    std::lock_guard<std::mutex> lk(pending_compressed_mu_);
+    auto it = pending_compressed_.find(ack_slot);
+    if (it != pending_compressed_.end()) {
+      it->second.compress_buffer_slot = req->compress_buffer_slot;
+    }
+  }
   uint32_t first_seg = req->local_mem->size;
   req->remote_mem = std::make_shared<RemoteMemInfo>(
       slot_base, arena_bytes, remote_decompress_buf_.rkey_array,
@@ -812,8 +846,10 @@ int64_t SendConnection::compress_write_request_split_first(
 
   // Per-chunk auto-flush gives the round-robin interleaving required on
   // Broadcom bnxt_re (batching causes LOC_QP_OP_ERR vendor=0x3).
-  if (!post_compressed_segment(req, first_seg, first_chunks, num_channels, 0))
+  if (!post_compressed_segment(req, first_seg, first_chunks, num_channels, 0)) {
+    release_compress_slot();
     return kPostError;
+  }
   flush_batches();
 
   // Phase 2: encode tail, post as a single chunk on one channel.
@@ -832,8 +868,10 @@ int64_t SendConnection::compress_write_request_split_first(
   // Advance past phase-1 channels so phase-2 lands on the next one.
   req->channel_id = ((req->channel_id - 1 + first_chunks) % num_channels) + 1;
   if (!post_compressed_segment(req, second_seg, second_chunks, num_channels,
-                               first_chunks))
+                               first_chunks)) {
+    release_compress_slot();
     return kPostError;
+  }
   tracker_->update_expected_ack_count(wr_id, first_chunks + second_chunks);
   return wr_id;
 }
@@ -890,6 +928,7 @@ void SendConnection::poll_ack_ring() {
   if (pending_compressed_count_.load(std::memory_order_relaxed) == 0) return;
   auto* slots = static_cast<AckSlot*>(ack_ring_->addr);
   std::vector<uint64_t> released_offsets;
+  std::vector<int> released_cslots;
   {
     std::lock_guard<std::mutex> lk(pending_compressed_mu_);
     for (auto it = pending_compressed_.begin();
@@ -904,11 +943,18 @@ void SendConnection::poll_ack_ring() {
       slots[ack_slot].value.store(0, std::memory_order_relaxed);
       if (it->second.arena_bytes > 0)
         released_offsets.push_back(it->second.arena_offset);
+      if (it->second.compress_buffer_slot >= 0)
+        released_cslots.push_back(it->second.compress_buffer_slot);
       it = pending_compressed_.erase(it);
       pending_compressed_count_.fetch_sub(1, std::memory_order_relaxed);
     }
   }
   for (auto off : released_offsets) decompress_arena_.release(off);
+  // The peer's decompression ACK implies all chunk CQEs (NIC DMAs out of the
+  // writer-side staging slot) are done — safe to hand the slot back.
+  for (int slot : released_cslots) {
+    Compressor::get_instance().free_compress_slot(slot);
+  }
 }
 
 void SendConnection::maybe_push_compressed_meta(int64_t wr_id) {

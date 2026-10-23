@@ -166,6 +166,7 @@ class SendConnection : public RDMAConnection {
     WriteReqMeta meta;
     uint64_t arena_offset = 0;
     uint64_t arena_bytes = 0;
+    int compress_buffer_slot = -1;
     bool meta_pushed = false;
   };
   std::mutex pending_compressed_mu_;

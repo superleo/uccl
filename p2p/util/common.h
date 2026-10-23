@@ -489,6 +489,9 @@ struct RDMASendRequest {
   bool need_signaled;  // Whether to use IBV_SEND_SIGNALED flag
   SendType send_type = SendType::Send;
   CompressCtx compress_ctx;
+  // Compress-buffer slot (writer-side staging) assigned by the codec backend
+  // for this request; -1 = none. Freed when all chunk ACKs are in.
+  int compress_buffer_slot = -1;
   // Set when the source handle has no user MR; must take the compression path.
   bool compress_only = false;
   // Constructor

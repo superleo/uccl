@@ -4,8 +4,20 @@
 #include "util/util.h"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
+
+// 诊断专用分段计时（VC_COMP_PHASE_TIMING=1）：打印 writer 侧压缩路径中
+// 各次同步等待的实际耗时。会额外增加 host 侧计时开销，仅用于瓶颈归因，
+// 不得用于正式性能采样。
+namespace {
+inline bool comp_phase_timing_enabled() {
+  static bool const enabled = std::getenv("VC_COMP_PHASE_TIMING") != nullptr;
+  return enabled;
+}
+}  // namespace
 
 size_t get_min_compress_bytes_from_env() {
   char const* env = std::getenv("UCCL_P2P_MIN_COMPRESS_BYTES");
@@ -184,9 +196,9 @@ void NullCompressorBackend::prepare_split_context(void* /*addr*/,
                                                   size_t /*size*/,
                                                   CompressCtx /*ctx*/) {}
 
-bool NullCompressorBackend::compress_split_one_batch(
+SplitBatchResult NullCompressorBackend::compress_split_one_batch(
     std::shared_ptr<RDMASendRequest> /*req*/) {
-  return false;
+  return SplitBatchResult::kFailed;
 }
 
 uint32_t NullCompressorBackend::compress_encode_one_batch(
@@ -255,6 +267,12 @@ DietGPUCompressorBackend::DietGPUCompressorBackend()
   // Initialize StackDeviceMemory for compress/decompress operations
   res_ = new dietgpu::StackDeviceMemory(dietgpu::getCurrentDevice(),
                                         3 * kCompressBufferSize);
+
+  // Writer-side slot pool: pipelined writers keep multiple compressed
+  // messages in flight; each needs its own staging interval in buffer_.
+  size_t num_slots = kCompressBufferSize / kSlotBytes;
+  if (num_slots < 1) num_slots = 1;
+  slot_busy_.assign(num_slots, 0);
   // Per-ctx split metadata is now allocated/freed directly by each
   // FloatCompressCtx via gpuMalloc/gpuFree — no stack allocator needed.
 }
@@ -289,6 +307,7 @@ bool DietGPUCompressorBackend::compress(std::shared_ptr<RDMASendRequest> req) {
     UCCL_LOG(WARN) << "DietGPUCompressorBackend::compress - Invalid parameters";
     return false;
   }
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
   // Setup compression config
@@ -351,6 +370,7 @@ bool DietGPUCompressorBackend::decompress(RemoteMemInfo const& input,
     return false;
   }
 
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
   dietgpu::FloatType ft = to_dietgpu(float_type);
 
@@ -403,6 +423,7 @@ void DietGPUCompressorBackend::decompress_async(RemoteMemInfo const& input,
     if (on_done) on_done(user_data);
     return;
   }
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
   dietgpu::FloatType ft = to_dietgpu(float_type);
   dietgpu::FloatDecompressConfig cfg;
@@ -453,6 +474,7 @@ void DietGPUCompressorBackend::prepare_split_context(void* addr, size_t size,
   if (unlikely(ctx->get_float_type() == FloatType::kUndefined)) {
     return;
   }
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
   auto float_ctx = std::static_pointer_cast<FloatCompressCtx>(ctx);
   dietgpu::FloatType float_type = to_dietgpu(float_ctx->get_float_type());
@@ -492,15 +514,69 @@ void DietGPUCompressorBackend::prepare_split_context(void* addr, size_t size,
   float_ctx->maxSize = size;
 }
 
-bool DietGPUCompressorBackend::compress_split_one_batch(
+// Assign an exclusive writer-side staging slot for this request. Returns -1
+// when the message's worst-case compressed size cannot fit a slot or when all
+// slots are busy (caller may retry after draining completions). On success the
+// ctx's device-side out pointer is re-aimed (stream-ordered before the split
+// kernels) at the slot interval so concurrent in-flight messages never alias.
+int DietGPUCompressorBackend::alloc_compress_slot(FloatCompressCtx& ctx) {
+  dietgpu::FloatType ft = to_dietgpu(ctx.get_float_type());
+  // getMaxFloatCompressedSize takes an element count and halves fp8 itself.
+  uint32_t elems = static_cast<uint32_t>(
+      dietgpu::getElementCountFromBytes(ft, ctx.maxSize));
+  uint32_t need = dietgpu::getMaxFloatCompressedSize(ft, elems);
+  int slot = -1;
+  bool any_fits = false;
+  {
+    std::lock_guard<std::mutex> lk(slot_mu_);
+    for (size_t i = 0; i < slot_busy_.size(); ++i) {
+      if (slot_capacity(static_cast<int>(i)) < need) continue;
+      any_fits = true;
+      if (!slot_busy_[i]) {
+        slot_busy_[i] = 1;
+        slot = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  if (slot < 0) {
+    if (!any_fits) {
+      UCCL_LOG(WARN) << "alloc_compress_slot: max compressed size " << need
+                     << " exceeds every compress-buffer slot";
+      return -2;
+    }
+    return -1;
+  }
+  uintptr_t out_word = reinterpret_cast<uintptr_t>(compress_slot_base(slot));
+  GPU_RT_CHECK(gpuMemcpyAsync(
+      static_cast<char*>(ctx.raw_params_dev) + 2 * sizeof(uintptr_t),
+      &out_word, sizeof(uintptr_t), gpuMemcpyHostToDevice, stream_));
+  return slot;
+}
+
+void DietGPUCompressorBackend::free_compress_slot(int slot) {
+  if (slot < 0) return;
+  std::lock_guard<std::mutex> lk(slot_mu_);
+  if (slot >= 0 && static_cast<size_t>(slot) < slot_busy_.size()) {
+    slot_busy_[slot] = 0;
+  }
+}
+
+SplitBatchResult DietGPUCompressorBackend::compress_split_one_batch(
     std::shared_ptr<RDMASendRequest> req) {
   if (unlikely(!req || !req->compress_ctx || !stream_ || !res_)) {
     UCCL_LOG(WARN) << "DietGPUCompressorBackend::compress_split_one_batch - "
                       "Invalid parameters";
-    return false;
+    return SplitBatchResult::kFailed;
   }
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
+
+  int slot = alloc_compress_slot(*ctx);
+  if (slot == -1) return SplitBatchResult::kBusy;
+  if (slot < 0) return SplitBatchResult::kFailed;
+  req->compress_buffer_slot = slot;
 
   dietgpu::FloatCompressConfig compressConfig;
   compressConfig.floatType = to_dietgpu(ctx->get_float_type());
@@ -514,8 +590,8 @@ bool DietGPUCompressorBackend::compress_split_one_batch(
                              compressConfig.floatType, ctx->maxSize),
                          ChunkSplitStrategy::kMessageChunkSizeKB);
   req->local_mem = std::make_shared<RegMemBlock>(
-      buffer_->addr, data_size, buffer_->mr_array, buffer_->type);
-  return true;
+      compress_slot_base(slot), data_size, buffer_->mr_array, buffer_->type);
+  return SplitBatchResult::kOk;
 }
 
 uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
@@ -525,7 +601,13 @@ uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
                       "Invalid parameters";
     return 0;
   }
+  std::lock_guard<std::mutex> codec_lock(codec_mu_);
   ScopedCodecDeviceGuard guard(device_idx_);
+  if (req->compress_buffer_slot < 0 ||
+      static_cast<size_t>(req->compress_buffer_slot) >= slot_busy_.size()) {
+    UCCL_LOG(WARN) << "compress_encode_one_batch: missing compress-buffer slot";
+    return 0;
+  }
   auto ctx = std::static_pointer_cast<FloatCompressCtx>(req->compress_ctx);
 
   dietgpu::FloatCompressConfig compressConfig;
@@ -533,12 +615,38 @@ uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
   compressConfig.useChecksum = false;
   compressConfig.is16ByteAligned = true;
 
+  bool const timing = comp_phase_timing_enabled();
+  auto const t_esub0 = timing ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
   dietgpu::floatCompressEncodeOneBatch(*res_, compressConfig, *ctx,
                                        dev_compressed_size_, stream_);
+  // Launch-to-return only. The synchronous D2H below waits for the encode
+  // kernel, so a separate gpuStreamSynchronize would serialize the hot path
+  // twice. size_d2h therefore includes kernel completion plus the copy.
+  auto const t_launch = timing ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
   // Get compressed size
   uint32_t compressedSize = 0;
   GPU_RT_CHECK(gpuMemcpy(&compressedSize, dev_compressed_size_,
                          sizeof(compressedSize), gpuMemcpyDeviceToHost));
+  uint32_t uncompressed_size = req->local_mem->size;
+  if (timing) {
+    auto t_d2h = std::chrono::steady_clock::now();
+    // wire_bytes = 两段写入的总和（split 原样段 + ANS 压缩尾段）；
+    // msg_bytes = 原始消息大小，ratio 即线路扩展因子。
+    uint32_t const msg_bytes = static_cast<uint32_t>(ctx->maxSize);
+    fprintf(stderr,
+            "[compress] encode_submit=%.3fms size_d2h=%.3fms "
+            "wire_bytes=%u msg_bytes=%u split_raw=%u ans_tail=%u ratio=%.4f\n",
+            std::chrono::duration<double, std::milli>(t_launch - t_esub0)
+                .count(),
+            std::chrono::duration<double, std::milli>(t_d2h - t_launch).count(),
+            compressedSize, msg_bytes, uncompressed_size,
+            compressedSize - uncompressed_size,
+            msg_bytes ? static_cast<float>(compressedSize) /
+                            static_cast<float>(msg_bytes)
+                      : 0.0f);
+  }
 
   UCCL_LOG(INFO, UCCL_RDMA)
       << "DietGPUCompressorBackend: Encode done, " << req->local_mem->size
@@ -548,9 +656,9 @@ uint32_t DietGPUCompressorBackend::compress_encode_one_batch(
       << "x";
 
   // Update request to use compressed buffer
-  uint32_t uncompressed_size = req->local_mem->size;
+  void* slot_base = compress_slot_base(req->compress_buffer_slot);
   req->local_mem = std::make_shared<RegMemBlock>(
-      static_cast<char*>(buffer_->addr) + uncompressed_size,
+      static_cast<char*>(slot_base) + uncompressed_size,
       compressedSize - uncompressed_size, buffer_->mr_array, buffer_->type);
   req->remote_mem->addr = req->remote_mem->addr + uncompressed_size;
   ctx->histogram_dev.release();
@@ -604,7 +712,7 @@ void Compressor::prepare_split_context(void* addr, size_t size,
   backend_->prepare_split_context(addr, size, ctx);
 }
 
-bool Compressor::compress_split_one_batch(
+SplitBatchResult Compressor::compress_split_one_batch(
     std::shared_ptr<RDMASendRequest> req) {
   return backend_->compress_split_one_batch(req);
 }
@@ -612,6 +720,10 @@ bool Compressor::compress_split_one_batch(
 uint32_t Compressor::compress_encode_one_batch(
     std::shared_ptr<RDMASendRequest> req) {
   return backend_->compress_encode_one_batch(req);
+}
+
+void Compressor::free_compress_slot(int slot) {
+  backend_->free_compress_slot(slot);
 }
 
 CompressStrategy Compressor::get_compress_strategy() {

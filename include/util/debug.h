@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iosfwd>
 #include <iostream>
 #include <mutex>
@@ -324,8 +325,12 @@ class UCCLLogger {
     std::lock_guard<std::mutex> lock(mu_);
 
     // NOTE: flush on every write, not sure if that is what we want though
-    // TODO: add time?
-    stream_ << "[" << logLevelToString(logLevel);
+    // Monotonic timestamp (µs) for latency phase analysis; no wall-clock in
+    // logs (no host/path leakage in shared reports).
+    struct timespec ts_;
+    clock_gettime(CLOCK_MONOTONIC, &ts_);
+    stream_ << "[" << (ts_.tv_sec * 1000000LL + ts_.tv_nsec / 1000) << "µs "
+            << logLevelToString(logLevel);
 
     if (logSubsysToString(subsys).size() > 0) {
       stream_ << " " << logSubsysToString(subsys);

@@ -26,6 +26,19 @@
 
 namespace dietgpu {
 
+// 0 means no override. Read once. An explicit 0 in the environment still
+// launches one block so the grid cannot be empty.
+inline uint32_t ansDecodeGridOverride() {
+  static uint32_t const v = [] {
+    char const* g = std::getenv("VC_ANS_DECODE_GRID");
+    if (!g || !*g) return 0u;
+    unsigned long n = std::strtoul(g, nullptr, 10);
+    if (n < 1ul) return 1u;
+    return static_cast<uint32_t>(n);
+  }();
+  return v;
+}
+
 using TableT = uint32_t;
 
 // We are limited to 11 bits of probability resolution
@@ -503,15 +516,36 @@ ANSDecodeStatus ansDecodeBatch(
     OutProvider& outProvider,
     uint8_t* outSuccess_dev,
     uint32_t* outSize_dev,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    // 可选：调用方已知的每个 batch 成员的 ANS 数据块数上界
+    //（divUp(未压缩符号数, kDefaultBlockSize)）。0 表示未知，退回传统的
+    // 过度订阅 grid。仅用于收缩 launch 规模，不影响正确性：kernel 侧
+    // 始终以 grid-stride 循环覆盖全部数据块。
+    uint32_t numBlocksHint = 0) {
   auto table_dev =
       res.alloc<TableT>(stream, numInBatch * (1 << config.probBits));
+
+  // Diagnostic-only staged timing (VC_DECOMP_SYNC_TIMING=1): adds host syncs
+  // that alter latency, so it is never enabled for official numbers.
+  static bool const kSyncTiming =
+      std::getenv("VC_DECOMP_SYNC_TIMING") != nullptr;
+  cudaEvent_t ev_table_start, ev_table_end, ev_decode_end;
+  if (kSyncTiming) {
+    cudaEventCreateWithFlags(&ev_table_start, cudaEventDefault);
+    cudaEventCreateWithFlags(&ev_table_end, cudaEventDefault);
+    cudaEventCreateWithFlags(&ev_decode_end, cudaEventDefault);
+    cudaEventRecord(ev_table_start, stream);
+  }
 
   // Build the rANS decoding table from the compression header
   {
     constexpr int kThreads = 512;
     ansDecodeTable<InProvider, kThreads><<<numInBatch, kThreads, 0, stream>>>(
         inProvider, config.probBits, table_dev.data());
+  }
+
+  if (kSyncTiming) {
+    cudaEventRecord(ev_table_end, stream);
   }
 
   // Perform decoding
@@ -539,7 +573,34 @@ ANSDecodeStatus ansDecodeBatch(
         0));                                                       \
     uint32_t maxGrid = maxBlocksPerSM * props.multiProcessorCount; \
     uint32_t perBatchGrid = divUp(maxGrid, numInBatch) * 4;        \
+    /* 自适应收缩：每个 kernel block 含 kThreads/kWarpSize 个 warp， */ \
+    /* 每个 warp 以 grid-stride 循环认领 ANS 块。已知块数上界时，   */ \
+    /* 超过 divUp(numBlocks, 每 block warp 数) 的 block 只会空跑     */ \
+    /* 前导（含 4KB 查找表加载）后退出。MUSA 上该空跑成本 ~12.6us/块 */ \
+    /* 且随 launch 串行化，是小包 decode 延迟的主导项。               */ \
+    if (numBlocksHint > 0) {                                       \
+      constexpr uint32_t kWarpsPerKernelBlock =                   \
+          (uint32_t)(kThreads / kWarpSize);                       \
+      uint32_t gridForBlocks =                                    \
+          divUp(numBlocksHint, kWarpsPerKernelBlock);             \
+      if (gridForBlocks < perBatchGrid) {                          \
+        perBatchGrid = gridForBlocks;                              \
+      }                                                            \
+      if (perBatchGrid < 1) {                                      \
+        perBatchGrid = 1;                                           \
+      }                                                            \
+    }                                                              \
+    if (uint32_t override_grid = ansDecodeGridOverride()) {       \
+      perBatchGrid = override_grid;                                \
+    }                                                              \
     auto grid = dim3(perBatchGrid, numInBatch);                    \
+    if (kSyncTiming) {                                             \
+      fprintf(stderr,                                              \
+              "[ansDecode] maxBlocksPerSM=%d SMs=%d numInBatch=%u " \
+              "perBatchGrid=%u hint=%u\n",                         \
+              maxBlocksPerSM, props.multiProcessorCount,           \
+              numInBatch, perBatchGrid, numBlocksHint);            \
+    }                                                              \
                                                                    \
     ansDecodeKernel<                                               \
         InProvider,                                                \
@@ -552,6 +613,18 @@ ANSDecodeStatus ansDecodeBatch(
         outProvider,                                               \
         outSuccess_dev,                                            \
         outSize_dev);                                              \
+    if (kSyncTiming) {                                             \
+      cudaEventRecord(ev_decode_end, stream);                       \
+      cudaEventSynchronize(ev_decode_end);                          \
+      float ms_alloc = 0, ms_table = 0, ms_decode = 0;             \
+      cudaEventElapsedTime(&ms_alloc, ev_table_start, ev_table_end); \
+      cudaEventElapsedTime(&ms_table, ev_table_end, ev_decode_end); \
+      fprintf(stderr, "[ansDecode] split alloc+table=%.3fms "       \
+              "decode_kernel=%.3fms\n", ms_alloc, ms_table);       \
+      cudaEventDestroy(ev_table_start);                            \
+      cudaEventDestroy(ev_table_end);                              \
+      cudaEventDestroy(ev_decode_end);                             \
+    }                                                              \
   } while (false)
 
     switch (config.probBits) {

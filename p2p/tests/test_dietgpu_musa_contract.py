@@ -165,7 +165,7 @@ class DietGpuMusaContractTest(unittest.TestCase):
     def test_split_and_encode_do_not_repeat_codec_synchronization(self):
         source = COMPRESSION.read_text()
         split_start = source.index(
-            "bool DietGPUCompressorBackend::compress_split_one_batch("
+            "SplitBatchResult DietGPUCompressorBackend::compress_split_one_batch("
         )
         split_end = source.index(
             "uint32_t DietGPUCompressorBackend::compress_encode_one_batch(",

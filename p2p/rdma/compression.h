@@ -4,6 +4,8 @@
 #include "util/gpu_rt.h"
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 size_t get_min_compress_bytes_from_env();
 extern size_t const& kMinCompressBytes;
@@ -102,6 +104,12 @@ struct DummyCompressCtx : public CompressionContext {
 
 CompressCtx make_compress_ctx(FloatType ft);
 
+enum class SplitBatchResult {
+  kOk,      // split submitted; compress_buffer_slot is assigned
+  kBusy,    // every fitting slot is in flight; caller should drain and retry
+  kFailed,  // message cannot fit a slot, or the request is invalid
+};
+
 /**
  * @brief Abstract interface for compressor backends.
  *
@@ -174,9 +182,10 @@ class ICompressorBackend {
   /**
    * @brief Phase 1 of two-phase compression: split float data.
    * @param req The send request with compress_ctx already prepared.
-   * @return true on success, false on failure.
+   * @return kOk when the split is queued, kBusy when the slot pool is full,
+   * kFailed when the message cannot fit a slot or the request is invalid.
    */
-  virtual bool compress_split_one_batch(
+  virtual SplitBatchResult compress_split_one_batch(
       std::shared_ptr<RDMASendRequest> req) = 0;
 
   /**
@@ -186,6 +195,13 @@ class ICompressorBackend {
    */
   virtual uint32_t compress_encode_one_batch(
       std::shared_ptr<RDMASendRequest> req) = 0;
+
+  /**
+   * @brief Release a writer-side compress-buffer slot previously assigned to a
+   * request (called once all chunk ACKs for the request are in, i.e. the NIC
+   * no longer DMAs from the slot). No-op for backends without slots.
+   */
+  virtual void free_compress_slot(int slot) = 0;
 
   /**
    * @brief Get the compression strategy.
@@ -224,10 +240,13 @@ class NullCompressorBackend : public ICompressorBackend {
 
   void prepare_split_context(void* addr, size_t size, CompressCtx ctx) override;
 
-  bool compress_split_one_batch(std::shared_ptr<RDMASendRequest> req) override;
+  SplitBatchResult compress_split_one_batch(
+      std::shared_ptr<RDMASendRequest> req) override;
 
   uint32_t compress_encode_one_batch(
       std::shared_ptr<RDMASendRequest> req) override;
+
+  void free_compress_slot(int slot) override {}
 
   CompressStrategy get_compress_strategy() override;
 
@@ -266,10 +285,13 @@ class DietGPUCompressorBackend : public ICompressorBackend {
 
   void prepare_split_context(void* addr, size_t size, CompressCtx ctx) override;
 
-  bool compress_split_one_batch(std::shared_ptr<RDMASendRequest> req) override;
+  SplitBatchResult compress_split_one_batch(
+      std::shared_ptr<RDMASendRequest> req) override;
 
   uint32_t compress_encode_one_batch(
       std::shared_ptr<RDMASendRequest> req) override;
+
+  void free_compress_slot(int slot) override;
 
   CompressStrategy get_compress_strategy() override;
 
@@ -284,6 +306,32 @@ class DietGPUCompressorBackend : public ICompressorBackend {
   // may run on engine background threads whose current device differs;
   // kernel launches must be pinned to this device.
   int device_idx_;
+  // Serializes stream_, res_, and dev_compressed_size_. Registration
+  // (prepare_split_context) and the send thread both use this stream.
+  std::mutex codec_mu_;
+
+  // Writer-side compress-buffer slot pool. Pipelined writers keep several
+  // messages in flight. Each in-flight compressed message needs its own
+  // staging interval inside buffer_ so the next message's split kernels
+  // cannot overwrite bytes the NIC may still be DMA-ing. Slots are 256 MiB;
+  // assigned in compress_split and released on full-ACK. Slot capacity must
+  // cover getMaxFloatCompressedSize() of the largest message.
+  static size_t constexpr kSlotBytes = 256ull * 1024 * 1024;
+  std::mutex slot_mu_;
+  std::vector<char> slot_busy_;  // one byte per slot; nonzero = in use
+
+  int alloc_compress_slot(FloatCompressCtx& ctx);
+  size_t slot_capacity(int slot) const {
+    uint64_t begin = static_cast<uint64_t>(slot) * kSlotBytes;
+    if (!buffer_ || begin >= buffer_->size) return 0;
+    uint64_t avail = buffer_->size - begin;
+    if (avail > kSlotBytes) avail = kSlotBytes;
+    return static_cast<size_t>(avail);
+  }
+  void* compress_slot_base(int slot) {
+    return static_cast<char*>(buffer_->addr) +
+           static_cast<uint64_t>(slot) * kSlotBytes;
+  }
 };
 
 #endif  // USE_DIETGPU
@@ -363,9 +411,11 @@ class Compressor {
   /**
    * @brief Phase 1 of two-phase compression: split float data.
    * @param req The send request with compress_ctx already prepared.
-   * @return true on success, false on failure.
+   * @return kOk when the split is queued, kBusy when the slot pool is full,
+   * kFailed when the message cannot fit a slot or the request is invalid.
    */
-  bool compress_split_one_batch(std::shared_ptr<RDMASendRequest> req);
+  SplitBatchResult compress_split_one_batch(
+      std::shared_ptr<RDMASendRequest> req);
 
   /**
    * @brief Phase 2 of two-phase compression: ANS encode.
@@ -373,6 +423,9 @@ class Compressor {
    * @return compressed size on success, 0 on failure.
    */
   uint32_t compress_encode_one_batch(std::shared_ptr<RDMASendRequest> req);
+
+  /** Release a writer-side compress-buffer slot (full-ACK of the request). */
+  void free_compress_slot(int slot);
 
   /**
    * @brief Get the compression strategy.

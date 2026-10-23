@@ -59,6 +59,22 @@ uint32_t getMaxFloatCompressedSize(FloatType floatType, uint32_t size) {
   return baseSize;
 }
 
+// Number of ANS symbols the split kernel produces for a raw message of
+// `bytes` bytes: one symbol per float for 16/32-bit types, one symbol per
+// fp8 pair (two values packed into one uint16) for FP8. This mirrors the
+// per-batch `inSize` uploaded by the caller; deriving the encoder supply
+// or the split row width from the raw byte size instead over-provisions
+// the encode grid (2x for 16-bit floats, 4x for FP32).
+static uint32_t ansSymbolCountFromByteSize(FloatType ft, uint32_t bytes) {
+  uint32_t symbols =
+      static_cast<uint32_t>(getElementCountFromBytes(ft, bytes));
+  if (isFloat8Type(ft)) {
+    assert(symbols % 2 == 0);
+    symbols /= 2;
+  }
+  return symbols;
+}
+
 void floatCompress(
     StackDeviceMemory& res,
     const FloatCompressConfig& config,
@@ -204,9 +220,9 @@ void floatCompressSplitSize(
 
 
 void floatCompressSplitOneBatch(dietgpu::StackDeviceMemory& res,
-                                dietgpu::FloatCompressConfig const& config,
-                                cudaStream_t stream,
-                                FloatCompressSplitContext& ctx) {
+                                 dietgpu::FloatCompressConfig const& config,
+                                 cudaStream_t stream,
+                                 FloatCompressSplitContext& ctx) {
   initGreenContextIfNeeded(getCurrentDevice());
   assert(ctx.params_dev.data() != nullptr);
   assert(ctx.maxSize > 0);
@@ -221,13 +237,10 @@ void floatCompressSplitOneBatch(dietgpu::StackDeviceMemory& res,
   auto outProvider = BatchProviderPointer(out_dev);
 
   // ---- allocate split temporaries (stored as RAII in ctx) ----
-  // FP8 types pack two values into one uint16, so the effective element
-  // count (and therefore the compressed-row width) is half the raw byte size.
-  uint32_t effectiveMaxSize = ctx.maxSize;
-  if (isFloat8Type(config.floatType)) {
-    assert(effectiveMaxSize % 2 == 0);
-    effectiveMaxSize /= 2;
-  }
+  // ctx.maxSize is the raw message size in bytes; the split kernel produces
+  // one ANS symbol per float (per fp8 pair), so the row width is in symbols.
+  uint32_t effectiveMaxSize =
+      ansSymbolCountFromByteSize(config.floatType, ctx.maxSize);
   ctx.compRowStride = roundUp(effectiveMaxSize, sizeof(uint4));
 
   ctx.toComp_dev = res.alloc<uint8_t>(stream, ctx.compRowStride);
@@ -260,6 +273,12 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
   assert(ctx.histogram_dev.data() != nullptr);
   assert(ctx.maxSize > 0);
 
+  // Supply the encoder with the actual ANS symbol count (per float / per
+  // fp8 pair), not the raw byte size: deriving the block grid from bytes
+  // launched a 2x/4x over-provisioned grid for 16/32-bit floats.
+  uint32_t const maxSymbols =
+      ansSymbolCountFromByteSize(config.floatType, ctx.maxSize);
+
   // ---- unpack params ----
   auto in_dev = reinterpret_cast<void const**>(ctx.params_dev.data() + 0);
   auto inSize_dev =
@@ -281,7 +300,7 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
 
       runANSEncodeForType<FloatType::kFloat16>(
           res, config.ansConfig, 1, inProvider, inProviderANS,
-          ctx.histogram_dev.data(), ctx.maxSize, outProviderANS, outSize_dev,
+          ctx.histogram_dev.data(), maxSymbols, outProviderANS, outSize_dev,
           stream);
       break;
     }
@@ -293,7 +312,7 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
 
       runANSEncodeForType<FloatType::kBFloat16>(
           res, config.ansConfig, 1, inProvider, inProviderANS,
-          ctx.histogram_dev.data(), ctx.maxSize, outProviderANS, outSize_dev,
+          ctx.histogram_dev.data(), maxSymbols, outProviderANS, outSize_dev,
           stream);
       break;
     }
@@ -305,7 +324,7 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
 
       runANSEncodeForType<FloatType::kFloat32>(
           res, config.ansConfig, 1, inProvider, inProviderANS,
-          ctx.histogram_dev.data(), ctx.maxSize, outProviderANS, outSize_dev,
+          ctx.histogram_dev.data(), maxSymbols, outProviderANS, outSize_dev,
           stream);
       break;
     }
@@ -317,7 +336,7 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
 
       runANSEncodeForType<FloatType::kFloat8E4M3FN>(
           res, config.ansConfig, 1, inProvider, inProviderANS,
-          ctx.histogram_dev.data(), ctx.maxSize, outProviderANS, outSize_dev,
+          ctx.histogram_dev.data(), maxSymbols, outProviderANS, outSize_dev,
           stream);
       break;
     }
@@ -329,7 +348,7 @@ void floatCompressEncodeOneBatch(dietgpu::StackDeviceMemory& res,
 
       runANSEncodeForType<FloatType::kFloat8E5M2>(
           res, config.ansConfig, 1, inProvider, inProviderANS,
-          ctx.histogram_dev.data(), ctx.maxSize, outProviderANS, outSize_dev,
+          ctx.histogram_dev.data(), maxSymbols, outProviderANS, outSize_dev,
           stream);
       break;
     }
