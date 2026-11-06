@@ -1,0 +1,16 @@
+MUSA_HOME ?= /usr/local/musa
+MPICXX ?= mpicxx
+MCC ?= $(MUSA_HOME)/bin/mcc
+
+.PHONY: visibility
+visibility: build/musa_visibility_probe
+
+build:
+	mkdir -p $@
+
+build/musa_visibility_kernels.o: musa_visibility_kernels.mu musa_visibility_kernels.h | build
+	$(MCC) -std=c++17 -O2 -g -I$(MUSA_HOME)/include -c $< -o $@
+
+build/musa_visibility_probe: musa_visibility_probe.cc build/musa_visibility_kernels.o | build
+	$(MPICXX) -std=c++17 -O2 -g -Wall -Wextra -I.. -I$(MUSA_HOME)/include $^ \
+		-L$(MUSA_HOME)/lib -Wl,-rpath,$(MUSA_HOME)/lib -lmusart -ldl -o $@
